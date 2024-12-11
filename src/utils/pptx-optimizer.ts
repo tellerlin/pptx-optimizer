@@ -152,17 +152,26 @@ async function removeUnusedElements(zip: JSZip) {
   }
 }
 
-
-async function removeEmbeddedFonts(zip: JSZip) {
+async function removeEmbeddedFonts(zip: JSZip): Promise<void> {
   const commonFonts = [
     "Arial", "Calibri", "Times New Roman", 
     "Microsoft YaHei", "Helvetica", "Verdana"
   ];
 
 
-  // Process slide layouts
   const slideLayoutFiles = zip.folder('ppt/slideLayouts')?.files || {};
-  
+  const fontFolder = zip.folder('ppt/fonts');
+
+
+  if (!fontFolder) return;
+
+
+  // 直接删除字体文件夹中的所有文件
+  Object.keys(fontFolder.files).forEach(filename => {
+    delete fontFolder.files[filename];
+  });
+
+
   for (const filename in slideLayoutFiles) {
     const file = slideLayoutFiles[filename];
     if (file.dir) continue;
@@ -170,23 +179,55 @@ async function removeEmbeddedFonts(zip: JSZip) {
 
     try {
       const xmlContent = await file.async('string');
-      const layoutObj = await parseStringPromise(xmlContent);
       
-      // Remove embedded fonts
-      if (layoutObj['p:sldLayout'] && layoutObj['p:sldLayout']['a:theme']) {
-        const fonts = layoutObj['p:sldLayout']['a:theme'][0]['a:fontScheme'][0]['a:majorFont'][0]['a:font'];
+      // 使用更安全的 XML 解析方式
+      const parseOptions = {
+        trim: true,
+        explicitArray: false,
+        ignoreAttrs: false,
+        charkey: '_',
+        attrkey: '$'
+      };
+
+
+      const layoutObj = await parseStringPromise(xmlContent, parseOptions);
+      
+      // 移除嵌入字体
+      if (layoutObj['p:sldLayout'] && 
+          layoutObj['p:sldLayout']['a:theme'] && 
+          layoutObj['p:sldLayout']['a:theme'][0]['a:fontScheme']) {
         
-        layoutObj['p:sldLayout']['a:theme'][0]['a:fontScheme'][0]['a:majorFont'][0]['a:font'] = 
-          fonts.filter((font: any) => !commonFonts.includes(font['$']['name']));
+        const fontScheme = layoutObj['p:sldLayout']['a:theme'][0]['a:fontScheme'][0];
+        
+        // 保留常用字体
+        if (fontScheme['a:majorFont'] && fontScheme['a:majorFont'][0]['a:font']) {
+          fontScheme['a:majorFont'][0]['a:font'] = 
+            fontScheme['a:majorFont'][0]['a:font'].filter((font: any) => 
+              commonFonts.includes(font['$']['name'])
+            );
+        }
+
+
+        if (fontScheme['a:minorFont'] && fontScheme['a:minorFont'][0]['a:font']) {
+          fontScheme['a:minorFont'][0]['a:font'] = 
+            fontScheme['a:minorFont'][0]['a:font'].filter((font: any) => 
+              commonFonts.includes(font['$']['name'])
+            );
+        }
       }
 
 
-      const builder = new Builder();
+      const builder = new Builder({
+        renderOpts: { pretty: false },
+        xmldec: { version: '1.0', encoding: 'UTF-8' }
+      });
+
+
       const updatedXml = builder.buildObject(layoutObj);
       
       zip.file(`ppt/slideLayouts/${filename}`, updatedXml);
     } catch (error) {
-      console.error(`Error processing layout ${filename}:`, error);
+      console.warn(`Skipping font processing for ${filename}:`, error);
     }
   }
 }
