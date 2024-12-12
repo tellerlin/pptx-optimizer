@@ -3,13 +3,9 @@
 
 import React, { useState } from 'react';
 import { 
-  Box, 
-  Button, 
-  CircularProgress, 
-  Container, 
-  Typography, 
-  Alert, 
-  Snackbar 
+  Box, Button, CircularProgress, Container, Typography, 
+  Alert, Snackbar, Dialog, DialogTitle, DialogContent, 
+  DialogActions, Checkbox, FormControlLabel, Slider, Grid 
 } from '@mui/material';
 import { CloudUpload, CheckCircle, Error as ErrorIcon } from '@mui/icons-material';
 import { optimizePPTX } from '../utils/pptx-optimizer';
@@ -20,6 +16,11 @@ export default function Home() {
   const [alertOpen, setAlertOpen] = useState(false);
   const [alertMessage, setAlertMessage] = useState('');
   const [alertSeverity, setAlertSeverity] = useState<'success' | 'error'>('success');
+  const [optimizationDialogOpen, setOptimizationDialogOpen] = useState(false);
+  const [removeHiddenSlides, setRemoveHiddenSlides] = useState(true);
+  const [compressImages, setCompressImages] = useState(true);
+  const [imageQuality, setImageQuality] = useState(70);
+  const [removeUnusedMedia, setRemoveUnusedMedia] = useState(true);
 
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -27,26 +28,44 @@ export default function Home() {
     if (!file) return;
 
 
-    // 文件类型验证
     if (!file.name.toLowerCase().endsWith('.pptx')) {
       showAlert('Please upload a valid PPTX file', 'error');
       return;
     }
 
 
-    // 文件大小限制（例如：最大100MB）
-    const maxSize = 300 * 1024 * 1024; // 300MB
+    const maxSize = 300 * 1024 * 1024;
     if (file.size > maxSize) {
       showAlert('File is too large. Maximum file size is 300MB', 'error');
       return;
     }
 
 
+    setOptimizationDialogOpen(true);
+  };
+
+
+  const performOptimization = async () => {
+    const fileInput = document.getElementById('file-upload') as HTMLInputElement;
+    const file = fileInput.files?.[0];
+    if (!file) return;
+
+
+    setOptimizationDialogOpen(false);
     setIsProcessing(true);
+
+
     try {
-      const optimizedFile = await optimizePPTX(file);
+      const optimizedFile = await optimizePPTX(file, {
+        removeHiddenSlides,
+        compressImages: compressImages ? {
+          quality: imageQuality / 100,
+          maxWidth: 1920,
+          maxHeight: 1080
+        } : undefined,
+        removeUnusedMedia
+      });
       
-      // 创建下载链接
       const url = URL.createObjectURL(optimizedFile);
       const link = document.createElement('a');
       link.href = url;
@@ -57,7 +76,6 @@ export default function Home() {
       URL.revokeObjectURL(url);
 
 
-      // 显示成功提示
       showAlert('PPTX file optimized successfully!', 'success');
     } catch (error) {
       console.error('Error optimizing PPTX:', error);
@@ -164,8 +182,86 @@ export default function Home() {
           )}
         </Box>
 
+        <Dialog 
+          open={optimizationDialogOpen} 
+          onClose={() => setOptimizationDialogOpen(false)}
+          maxWidth="sm"
+          fullWidth
+          disableEnforceFocus
+          disableRestoreFocus
 
-        {/* 弹出提示 */}
+        >
+          <DialogTitle>Optimization Settings</DialogTitle>
+          <DialogContent>
+            <Grid container spacing={2}>
+              <Grid item xs={12}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={removeHiddenSlides}
+                      onChange={(e) => setRemoveHiddenSlides(e.target.checked)}
+                    />
+                  }
+                  label="Remove Hidden Slides"
+                />
+              </Grid>
+              
+              <Grid item xs={12}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={compressImages}
+                      onChange={(e) => setCompressImages(e.target.checked)}
+                    />
+                  }
+                  label="Compress Images"
+                />
+                {compressImages && (
+                  <Box sx={{ px: 2, pt: 1 }}>
+                    <Typography gutterBottom>
+                      Image Quality: {imageQuality}%
+                    </Typography>
+                    <Slider
+                      value={imageQuality}
+                      onChange={(_, newValue) => setImageQuality(newValue as number)}
+                      min={10}
+                      max={100}
+                      valueLabelDisplay="auto"
+                    />
+                  </Box>
+                )}
+              </Grid>
+              
+              <Grid item xs={12}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={removeUnusedMedia}
+                      onChange={(e) => setRemoveUnusedMedia(e.target.checked)}
+                    />
+                  }
+                  label="Remove Unused Media Files"
+                />
+              </Grid>
+            </Grid>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={() => setOptimizationDialogOpen(false)}>
+              Cancel
+              </Button>
+            <Button 
+              onClick={performOptimization} 
+              variant="contained" 
+              color="primary"
+            >
+              Optimize
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+
+
+
         <Snackbar 
           open={alertOpen} 
           autoHideDuration={6000} 
