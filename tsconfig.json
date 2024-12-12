@@ -5,10 +5,10 @@
       "dom.iterable",
       "esnext"
     ],
-
+    "target": "es2022",
     "baseUrl": ".",
-      "paths": {
-        "@/*": ["./src/*"]
+    "paths": {
+      "@/*": ["./src/*"]
     },
     "allowJs": true,
     "skipLibCheck": true,
