@@ -6,40 +6,32 @@ export async function collectUsedMedia(zip: JSZip): Promise<Set<string>> {
   const usedMediaFiles = new Set<string>();
 
   try {
-    // Get all slide files
+    // 获取所有幻灯片文件
     const slideFiles = Object.keys(zip.files)
       .filter(filename => filename.startsWith('ppt/slides/slide') && filename.endsWith('.xml'));
 
     await Promise.all(slideFiles.map(async (slideFile) => {
       try {
-        const slideXml = await zip.file(slideFile)?.async('string');
-        if (!slideXml) return;
+        // 处理幻灯片中的媒体文件
+        await processFileMedia(zip, slideFile, usedMediaFiles);
 
-        // Find all media references in the slide
-        const mediaRefs = slideXml.match(/r:embed="[^"]*"/g) || [];
-        
-        // Process each media reference
-        await Promise.all(mediaRefs.map(async (ref) => {
-          const relId = ref.replace(/r:embed="([^"]*)"/g, '$1');
-          const relsFile = `ppt/slides/_rels/${slideFile.split('/').pop()}.rels`;
-          
-          try {
-            const relsXml = await zip.file(relsFile)?.async('string');
-            if (!relsXml) return;
+        // 获取幻灯片的 rels 文件
+        const slideRelsFile = `ppt/slides/_rels/${slideFile.split('/').pop()}.rels`;
+        const slideRelsXml = await zip.file(slideRelsFile)?.async('string');
+        if (!slideRelsXml) return;
 
-            const relsObj = await parseStringPromise(relsXml);
-            const relationships = relsObj.Relationships?.Relationship || [];
-            
-            relationships.forEach((rel: any) => {
-              if (rel.$.Id === relId) {
-                const mediaPath = `ppt/media/${rel.$.Target.split('/').pop()}`;
-                usedMediaFiles.add(mediaPath);
-              }
-            });
-          } catch (error) {
-            console.warn(`Error processing relationships in ${relsFile}:`, error);
-          }
-        }));
+        // 解析 rels 文件找到关联的 layout
+        const slideRelsObj = await parseStringPromise(slideRelsXml);
+        const relationships = slideRelsObj.Relationships?.Relationship || [];
+        const layoutRel = relationships.find((rel: any) => 
+          rel.$.Type === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideLayout'
+        );
+
+        if (layoutRel) {
+          // 处理 layout 中的媒体文件
+          const layoutPath = `ppt/${layoutRel.$.Target.replace('../', '')}`;
+          await processFileMedia(zip, layoutPath, usedMediaFiles);
+        }
       } catch (error) {
         console.warn(`Error processing slide ${slideFile}:`, error);
       }
@@ -50,6 +42,116 @@ export async function collectUsedMedia(zip: JSZip): Promise<Set<string>> {
   }
 
   return usedMediaFiles;
+}
+
+// 处理文件中的媒体引用
+async function processFileMedia(zip: JSZip, filePath: string, usedMediaFiles: Set<string>): Promise<void> {
+  try {
+    const fileContent = await zip.file(filePath)?.async('string');
+    if (!fileContent) return;
+
+    // 查找所有媒体引用
+    const mediaRefs = fileContent.match(/r:embed="[^"]*"/g) || [];
+
+    // 获取文件的 rels 路径
+    const relsFile = `${filePath.substring(0, filePath.lastIndexOf('/'))}/_rels/${filePath.split('/').pop()}.rels`;
+    const relsContent = await zip.file(relsFile)?.async('string');
+    if (!relsContent) return;
+
+    const relsObj = await parseStringPromise(relsContent);
+    const relationships = relsObj.Relationships?.Relationship || [];
+
+    // 处理每个媒体引用
+    mediaRefs.forEach(ref => {
+      const relId = ref.replace(/r:embed="([^"]*)"/g, '$1');
+      const mediaRel = relationships.find((rel: any) => rel.$.Id === relId);
+      
+      if (mediaRel && mediaRel.$.Type.includes('/image')) {
+        const mediaPath = `ppt/media/${mediaRel.$.Target.split('/').pop()}`;
+        usedMediaFiles.add(mediaPath);
+      }
+    });
+  } catch (error) {
+    console.warn(`Error processing media in ${filePath}:`, error);
+  }
+}
+
+async function getUsedLayoutsAndMasters(zip: JSZip): Promise<{
+  layouts: Set<string>;
+  masters: Set<string>;
+}> {
+  const usedLayouts = new Set<string>();
+  const usedMasters = new Set<string>();
+
+  try {
+    // 获取 presentation.xml 内容
+    const presentationXml = await zip.file('ppt/presentation.xml')?.async('string');
+    if (!presentationXml) return { layouts: usedLayouts, masters: usedMasters };
+
+    // 解析 presentation.xml
+    const presentationObj = await parseStringPromise(presentationXml);
+    const sldIdLst = presentationObj?.['p:presentation']?.['p:sldIdLst']?.[0]?.['p:sldId'] || [];
+
+    // 遍历所有非隐藏的幻灯片
+    for (const slide of sldIdLst) {
+      const slideRId = slide.$?.['r:id'];
+      if (!slideRId) continue;
+
+      // 获取幻灯片关系文件
+      const presentationRelsXml = await zip.file('ppt/_rels/presentation.xml.rels')?.async('string');
+      if (!presentationRelsXml) continue;
+
+      const presentationRels = await parseStringPromise(presentationRelsXml);
+      const relationships = presentationRels.Relationships?.Relationship || [];
+
+      // 找到幻灯片对应的关系
+      const slideRel = relationships.find((rel: any) => rel.$.Id === slideRId);
+      if (!slideRel) continue;
+
+      const slideFile = slideRel.$.Target.replace('../', 'ppt/');
+      const slideXml = await zip.file(slideFile)?.async('string');
+      if (!slideXml) continue;
+
+      const slideObj = await parseStringPromise(slideXml);
+      const layoutRId = slideObj?.['p:sld']?.$?.['r:id'];
+      if (!layoutRId) continue;
+
+      // 获取 slide 的 rels 文件
+      const slideRelsFile = `${slideFile.replace(/[^/]+$/, '')}_rels/${slideFile.split('/').pop()}.rels`;
+      const slideRelsXml = await zip.file(slideRelsFile)?.async('string');
+      if (!slideRelsXml) continue;
+
+      const slideRels = await parseStringPromise(slideRelsXml);
+      const layoutRel = slideRels.Relationships?.Relationship?.find((rel: any) => rel.$.Id === layoutRId);
+      if (!layoutRel) continue;
+
+      const layoutPath = layoutRel.$.Target.replace('../', 'ppt/');
+      usedLayouts.add(layoutPath);
+
+      // 获取 layout 对应的 master
+      const layoutXml = await zip.file(layoutPath)?.async('string');
+      if (!layoutXml) continue;
+
+      const layoutObj = await parseStringPromise(layoutXml);
+      const masterRId = layoutObj?.['p:sldLayout']?.$?.['r:id'];
+      if (!masterRId) continue;
+
+      const layoutRelsFile = `${layoutPath.replace(/[^/]+$/, '')}_rels/${layoutPath.split('/').pop()}.rels`;
+      const layoutRelsXml = await zip.file(layoutRelsFile)?.async('string');
+      if (!layoutRelsXml) continue;
+
+      const layoutRels = await parseStringPromise(layoutRelsXml);
+      const masterRel = layoutRels.Relationships?.Relationship?.find((rel: any) => rel.$.Id === masterRId);
+      if (!masterRel) continue;
+
+      const masterPath = masterRel.$.Target.replace('../', 'ppt/');
+      usedMasters.add(masterPath);
+    }
+  } catch (error) {
+    console.warn('Error getting used layouts and masters:', error);
+  }
+
+  return { layouts: usedLayouts, masters: usedMasters };
 }
 
 export function findAllMediaFiles(zip: JSZip): string[] {
