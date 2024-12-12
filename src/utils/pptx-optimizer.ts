@@ -54,8 +54,13 @@ export async function optimizePPTX(
                 zip.file(filename, optimizedImage);
               }
             } else {
-              // 如果文件未被引用，直接删除
-              delete zip.files[filename];
+              // 如果文件未被引用，使用占位文件替换
+              const extension = filename.split('.').pop()?.toLowerCase() || 'png';
+              const placeholderData = await createPlaceholderFile(
+                file.uncompressedSize,
+                extension
+              );
+              zip.file(filename, placeholderData);
             }
           } catch (error) {
             console.warn(`Failed to process image ${filename}:`, error);
@@ -64,12 +69,20 @@ export async function optimizePPTX(
       }
     }
 
-    // 删除未使用的媒体文件
+    // 替换未使用的媒体文件为占位文件
     if (options.removeUnusedMedia) {
       const unusedMediaFiles = findUnusedMedia(allMediaFiles, usedMediaFiles);
-      unusedMediaFiles.forEach(mediaPath => {
-        delete zip.files[mediaPath];
-      });
+      await Promise.all(unusedMediaFiles.map(async (mediaPath) => {
+        const file = zip.file(mediaPath);
+        if (!file) return;
+        
+        const extension = mediaPath.split('.').pop()?.toLowerCase() || 'png';
+        const placeholderData = await createPlaceholderFile(
+          file.uncompressedSize,
+          extension
+        );
+        zip.file(mediaPath, placeholderData);
+      }));
     }
 
     // 生成优化后的文件
