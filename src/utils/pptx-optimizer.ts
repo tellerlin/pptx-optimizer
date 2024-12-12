@@ -1,6 +1,13 @@
 import JSZip from 'jszip';  
 import { parseStringPromise, Builder } from 'xml2js';  
 
+const essentialFiles = [  
+  'ppt/presentation.xml',  
+  'docProps/core.xml',  
+  'docProps/app.xml',  
+  '[Content_Types].xml'  
+];
+
 async function optimizeImageInBrowser(imageData: ArrayBuffer): Promise<ArrayBuffer> {  
   return new Promise((resolve, reject) => {  
     const blob = new Blob([imageData]);  
@@ -69,67 +76,6 @@ async function listFilesInZip(zip: JSZip): Promise<{ [filename: string]: number 
 }
 
 
-export async function optimizePPTX(file: File): Promise<Blob> {  
-  if (typeof window === 'undefined') {  
-    throw new Error('This function can only be used in a browser environment');  
-  }  
-
-  const startTime = performance.now();  
-  const originalSize = file.size;  
-
-  const arrayBuffer = await file.arrayBuffer();  
-  const zip = new JSZip();  
-  await zip.loadAsync(arrayBuffer);  
-  console.log('PPTX file loaded into JSZip');  
-
-  try {  
-    console.log('Processing images');  
-    await processImages(zip);  
-    console.log('Images processed');  
-
-    console.log('Removing unused slides');  
-    await removeUnusedSlides(zip);  
-    console.log('Unused slides removed');  
-
-    console.log('Removing unused media files');  
-    await removeUnusedMediaFiles(zip);  
-    console.log('Unused media files removed');  
-
-    console.log('Removing embedded fonts');  
-    await removeEmbeddedFonts(zip);  
-    console.log('Embedded fonts removed');  
-  } catch (error) {  
-    console.error('Optimization process encountered an error:', error);  
-    return new Blob([arrayBuffer], {  
-      type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'  
-    });  
-  }  
-
-  // List all files in the zip to check their status  
-  const fileList = await listFilesInZip(zip);  
-  console.log('Files in the optimized zip:', JSON.stringify(fileList, null, 2));  
-
-  const options = {  
-    type: 'blob',  
-    compression: 'DEFLATE',  
-    compressionOptions: {  
-      level: 9  
-    }  
-  };  
-
-  const optimizedBlob = await zip.generateAsync(options);  
-
-  const endTime = performance.now();  
-  console.log(`  
-    Optimization took: ${(endTime - startTime).toFixed(2)} ms  
-    Original file size: ${originalSize} bytes  
-    Optimized file size: ${optimizedBlob.size} bytes  
-    Size change: ${((optimizedBlob.size - originalSize) / originalSize * 100).toFixed(2)}%  
-  `);  
-
-  return optimizedBlob;  
-}
-
 async function processImages(zip: JSZip): Promise<void> {  
   const mediaFolder = zip.folder('ppt/media');  
   if (!mediaFolder) {  
@@ -164,6 +110,150 @@ async function processImages(zip: JSZip): Promise<void> {
   await Promise.allSettled(imageProcessTasks);  
 }
 
+
+async function collectUsedMedia(pptx: JSZip): Promise<Set<string>> {
+  const usedMediaFiles = new Set<string>();
+  const mediaTraversalTasks = [
+    { path: 'ppt/slides/_rels/', match: /\.rels$/ },
+    { path: 'ppt/slideLayouts/_rels/', match: /\.rels$/ },
+    { path: 'ppt/slideMasters/_rels/', match: /\.rels$/ },
+    { path: 'ppt/_rels/', match: /presentation\.xml\.rels$/ }
+  ];
+
+
+  // 并行处理关系文件
+  const relsProcessTasks = mediaTraversalTasks.flatMap(task => {
+    const relsFiles = Object.keys(pptx.files)
+      .filter(name => name.startsWith(task.path) && task.match.test(name));
+
+
+    return relsFiles.map(async (relsFile) => {
+      try {
+        const relsContent = await pptx.file(relsFile)?.async('string');
+        if (!relsContent) return;
+
+
+        const mediaMatches = relsContent.match(/Target="\.\.\/media\/([^"]+)"/g) || [];
+        mediaMatches.forEach(match => {
+          const mediaPath = match.match(/Target="\.\.\/media\/([^"]+)"/)?.[1];
+          if (mediaPath) {
+            usedMediaFiles.add(`ppt/media/${mediaPath}`);
+          }
+        });
+      } catch (error) {
+        console.warn(`Error processing relationship file ${relsFile}:`, error);
+      }
+    });
+  });
+
+
+  // 处理幻灯片 XML 文件
+  const slideFiles = Object.keys(pptx.files)
+    .filter(name => name.startsWith('ppt/slides/') && name.endsWith('.xml'));
+
+
+  const slideProcessTasks = slideFiles.map(async (slideFile) => {
+    try {
+      const slideContent = await pptx.file(slideFile)?.async('string');
+      if (!slideContent) return;
+
+
+      const slideRelsFile = slideFile.replace('.xml', '.xml.rels');
+      const slideRelsContent = await pptx.file(slideRelsFile)?.async('string');
+      
+      if (slideRelsContent) {
+        const rIdMatches = slideContent.matchAll(/r:embed="(rId\d+)"/g);
+        for (const match of rIdMatches) {
+          const rId = match[1];
+          const mediaMatch = slideRelsContent.match(new RegExp(`Id="${rId}"[^>]*Target="\.\.\/media\/([^"]+)"`));
+          if (mediaMatch) {
+            usedMediaFiles.add(`ppt/media/${mediaMatch[1]}`);
+          }
+        }
+      }
+    } catch (error) {
+      console.warn(`Error processing slide file ${slideFile}:`, error);
+    }
+  });
+
+
+  await Promise.allSettled([...relsProcessTasks, ...slideProcessTasks]);
+
+
+  return usedMediaFiles;
+}
+
+
+function findUnusedMedia(allMediaFiles: string[], usedMediaFiles: Set<string>): string[] {
+  return allMediaFiles.filter(mediaPath => 
+    !Array.from(usedMediaFiles).some(usedFile => 
+      mediaPath === usedFile || 
+      mediaPath.includes(usedFile) || 
+      usedFile.includes(mediaPath)
+    )
+  );
+}
+
+
+async function removeUnusedSlides(zip: JSZip): Promise<void> {
+  try {
+    const presentationXml = await zip.file('ppt/presentation.xml')?.async('string');
+    if (!presentationXml) {
+      console.warn('No presentation.xml found');
+      return;
+    }
+
+
+    const presentationObj = await parseStringPromise(presentationXml, {
+      explicitArray: false,
+      mergeAttrs: true,
+      trim: true
+    });
+
+
+    const sldIdLst = presentationObj['p:presentation']?.['p:sldIdLst'];
+    if (!sldIdLst || !sldIdLst['p:sldId']) {
+      console.warn('No slides found in presentation');
+      return;
+    }
+
+
+    const slides = Array.isArray(sldIdLst['p:sldId']) 
+      ? sldIdLst['p:sldId'] 
+      : [sldIdLst['p:sldId']];
+
+
+    // 只在确实有隐藏的幻灯片时才进行过滤
+    const visibleSlides = slides.filter((slide: any) => {
+      const show = slide['$']?.show ?? slide.show;
+      return show !== '0' && show !== false;
+    });
+
+
+    // 如果所有幻灯片都被过滤掉，保留原始幻灯片列表
+    if (visibleSlides.length === 0) {
+      console.warn('All slides would be removed, keeping original slides');
+      return;
+    }
+
+
+    presentationObj['p:presentation']['p:sldIdLst']['p:sldId'] = visibleSlides;
+
+
+    const builder = new Builder({
+      renderOpts: { pretty: true },
+      xmldec: { version: '1.0', encoding: 'UTF-8' }
+    });
+
+
+    const updatedXml = builder.buildObject(presentationObj);
+    zip.file('ppt/presentation.xml', updatedXml);
+  } catch (error) {
+    console.error('Error removing unused slides:', error);
+  }
+}
+
+
 async function removeEmbeddedFonts(zip: JSZip): Promise<void> {  
   try {  
     const fontFolder = zip.folder('ppt/fonts');  
@@ -176,13 +266,18 @@ async function removeEmbeddedFonts(zip: JSZip): Promise<void> {
       console.log('No fonts folder found');  
     }  
 
-    const presentationXml = await zip.file('ppt/presentation.xml')?.async('string');  
-    if (presentationXml) {  
-      const presentationObj = await parseStringPromise(presentationXml);  
+
+    // 修改这部分代码
+    const presentationXml = zip.file('ppt/presentation.xml');
+    if (presentationXml) {
+      const presentationXmlContent = await presentationXml.async('string');
+      const presentationObj = await parseStringPromise(presentationXmlContent);  
+
 
       if (presentationObj['p:presentation'] && presentationObj['p:presentation']['a:extLst']) {  
         delete presentationObj['p:presentation']['a:extLst'];  
       }  
+
 
       const builder = new Builder();  
       const updatedXml = builder.buildObject(presentationObj);  
@@ -196,313 +291,128 @@ async function removeEmbeddedFonts(zip: JSZip): Promise<void> {
   }  
 }
 
+export async function optimizePPTX(file: File): Promise<Blob> {  
+  if (typeof window === 'undefined') {  
+    throw new Error('This function can only be used in a browser environment');  
+  }  
 
-async function removeUnusedSlides(zip: JSZip): Promise<void> {
-  try {
-    const presentationXml = await zip.file('ppt/presentation.xml')?.async('string');
-    if (!presentationXml) {
-      console.warn('No presentation.xml found');
-      return;
-    }
+  const startTime = performance.now();  
+  const originalSize = file.size;  
 
+  const arrayBuffer = await file.arrayBuffer();  
+  const zip = new JSZip();  
+  await zip.loadAsync(arrayBuffer);  
+  console.log('PPTX file loaded into JSZip');  
 
-    console.log('Raw presentation.xml content:', presentationXml);
+  // Check essential files initially  
+  if (!await checkEssentialFiles(zip)) {  
+    throw new Error('Essential files are missing in the original PPTX.');  
+  }  
 
+  try {  
+    console.log('Processing images');  
+    await processImages(zip);  
+    console.log('Images processed');  
 
-    const presentationObj = await parseStringPromise(presentationXml, {
-      explicitArray: false,
-      mergeAttrs: true,
-      trim: true
-    });
+    // Check essential files after processing images  
+    if (!await checkEssentialFiles(zip)) {  
+      throw new Error('Essential files are missing after processing images.');  
+    }  
 
+    console.log('Removing unused slides');  
+    await removeUnusedSlides(zip);  
+    console.log('Unused slides removed');  
 
-    console.log('Parsed presentationObj structure:', JSON.stringify(presentationObj, null, 2));
+    // Check essential files after removing unused slides  
+    if (!await checkEssentialFiles(zip)) {  
+      throw new Error('Essential files are missing after removing unused slides.');  
+    }  
 
+    console.log('Removing unused media files');  
+    await removeUnusedMediaFiles(zip);  
+    console.log('Unused media files removed');  
 
-    // 详细打印 presentationObj 的关键路径
-    console.log('p:presentation keys:', Object.keys(presentationObj['p:presentation'] || {}));
-    console.log('p:sldIdLst:', presentationObj['p:presentation']?.['p:sldIdLst']);
+    // Check essential files after removing unused media files  
+    if (!await checkEssentialFiles(zip)) {  
+      throw new Error('Essential files are missing after removing unused media files.');  
+    }  
 
+    console.log('Removing embedded fonts');  
+    await removeEmbeddedFonts(zip);  
+    console.log('Embedded fonts removed');  
+  } catch (error) {  
+    console.error('Optimization process encountered an error:', error);  
+    return new Blob([arrayBuffer], {  
+      type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'  
+    });  
+  }  
 
-    const sldIdLst = presentationObj['p:presentation']?.['p:sldIdLst'];
-    if (!sldIdLst || !sldIdLst['p:sldId']) {
-      console.warn('No slides found in presentation');
-      console.log('Full presentationObj:', JSON.stringify(presentationObj, null, 2));
-      return;
-    }
+  const fileList = await listFilesInZip(zip);  
+  console.log('Files in the optimized zip:', JSON.stringify(fileList, null, 2));  
 
+  // Final check for essential files  
+  if (!await checkEssentialFiles(zip)) {  
+    console.error('Error: Essential files are missing after optimization.');  
+    console.error('Missing files:', essentialFiles.filter(file => !zip.file(file)));  
+    return new Blob([arrayBuffer], {  
+      type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'  
+    });  
+  }  
 
-    // 确保 p:sldId 总是数组
-    const slides = Array.isArray(sldIdLst['p:sldId']) 
-      ? sldIdLst['p:sldId'] 
-      : [sldIdLst['p:sldId']];
+  const options = {  
+    type: 'blob',  
+    compression: 'DEFLATE',  
+    compressionOptions: {  
+      level: 9  
+    }  
+  };  
 
+  const optimizedBlob = await zip.generateAsync(options);  
 
-    console.log('Slides before filtering:', JSON.stringify(slides, null, 2));
+  const endTime = performance.now();  
+  console.log(`  
+    Optimization took: ${(endTime - startTime).toFixed(2)} ms  
+    Original file size: ${originalSize} bytes  
+    Optimized file size: ${optimizedBlob.size} bytes  
+  `);  
 
-
-    const visibleSlides = slides.filter((slide: any) => {
-      // 更健壮的判断逻辑
-      const show = slide['$']?.show ?? slide.show;
-      console.log('Slide show value:', show);
-      return show !== '0' && show !== false;
-    });
-
-
-    console.log('Visible slides:', JSON.stringify(visibleSlides, null, 2));
-
-
-    if (visibleSlides.length > 0) {
-      presentationObj['p:presentation']['p:sldIdLst']['p:sldId'] = visibleSlides;
-    } else {
-      console.warn('No visible slides found after filtering');
-    }
-
-
-    const builder = new Builder({
-      renderOpts: { pretty: true },
-      xmldec: { version: '1.0', encoding: 'UTF-8' }
-    });
-
-
-    const updatedXml = builder.buildObject(presentationObj);
-    console.log('Updated presentation.xml:', updatedXml);
-
-
-    zip.file('ppt/presentation.xml', updatedXml);
-  } catch (error) {
-    console.error('Error removing unused slides:', error);
-  }
+  return optimizedBlob;  
 }
 
+async function removeUnusedMediaFiles(zip: JSZip): Promise<void> {  
+  try {  
+    const usedMediaFiles = await collectUsedMedia(zip);  
+    const allMediaFiles = findAllMediaFiles(zip);  
+    const unusedMediaFiles = findUnusedMedia(allMediaFiles, usedMediaFiles);  
 
-async function removeUnusedMediaFiles(zip: JSZip): Promise<void> {
-  const mediaFolder = zip.folder('ppt/media');
-  if (!mediaFolder) {
-    console.log('No media folder found');
-    return;
-  }
+    // Protect essential files  
+    const filesToDelete = unusedMediaFiles.filter(file => !essentialFiles.includes(file));  
 
+    filesToDelete.forEach(mediaPath => {  
+      if (zip.files[mediaPath]) {  
+        delete zip.files[mediaPath];  
+        console.log(`Deleted: ${mediaPath}`);  
+      }  
+    });  
 
-  try {
-    const usedMediaFiles = new Set<string>();
-    console.log('Starting media file analysis...');
+    console.log(`Removed ${filesToDelete.length} unused media files`);  
+  } catch (error) {  
+    console.error('Error in removeUnusedMediaFiles:', error);  
+  }  
+}
 
+function findAllMediaFiles(zip: JSZip): string[] {  
+  const mediaExtensions = /\.(png|jpg|jpeg|gif|bmp|svg|bin)$/i;  
+  const mediaFiles = Object.keys(zip.files)  
+    .filter(name =>   
+      (name.startsWith('ppt/media/') && mediaExtensions.test(name)) ||  
+      name === 'docProps/thumbnail.jpeg'  
+    )  
+    .map(path => path.replace(/^(ppt\/media\/)+/, 'ppt/media/'))  
+    .filter((path, index, self) => self.indexOf(path) === index);  
+  return mediaFiles;  
+}
 
-    // 1. 处理幻灯片关系文件
-    const slideRelsFiles = Object.keys(zip.files).filter(
-      file => file.startsWith('ppt/slides/') && file.endsWith('.rels')
-    );
-
-
-    console.log('Slide relationship files found:', slideRelsFiles);
-
-
-    for (const relsFile of slideRelsFiles) {
-      try {
-        const relsXml = await zip.file(relsFile)?.async('string');
-        if (!relsXml) {
-          console.warn(`Could not read relationship file: ${relsFile}`);
-          continue;
-        }
-
-
-        const relsObj = await parseStringPromise(relsXml, {
-          explicitArray: false,
-          mergeAttrs: true,
-          trim: true
-        });
-
-
-        console.log(`Relationships in ${relsFile}:`, JSON.stringify(relsObj, null, 2));
-
-
-        const relationships = relsObj?.Relationships?.Relationship || [];
-        const mediaRels = Array.isArray(relationships) 
-          ? relationships 
-          : [relationships];
-
-
-        mediaRels.forEach((rel: any) => {
-          if (rel?.$ && 
-              rel.$['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image') {
-            const target = rel.$['Target'];
-            if (target) {
-              // 提取最后的文件名，支持多种路径格式
-              const mediaFilename = target.split('/').pop();
-              if (mediaFilename) {
-                usedMediaFiles.add(mediaFilename);
-                console.log(`Found media reference in relationships: ${mediaFilename}`);
-              }
-            }
-          }
-        });
-
-
-      } catch (relsError) {
-        console.warn(`Error processing relationships file ${relsFile}:`, relsError);
-      }
-    }
-
-
-    // 2. 处理幻灯片 XML 文件
-    const slideFiles = Object.keys(zip.files).filter(
-      file => file.startsWith('ppt/slides/') && file.endsWith('.xml')
-    );
-
-
-    console.log('Slide XML files found:', slideFiles);
-
-
-    for (const slideFile of slideFiles) {
-      try {
-        const slideXml = await zip.file(slideFile)?.async('string');
-        if (!slideXml) {
-          console.warn(`Could not read slide file: ${slideFile}`);
-          continue;
-        }
-
-
-        const imageRefPatterns = [
-          /r:embed="(rId\d+)"/g,
-          /a:blip\s+r:embed="(rId\d+)"/g
-        ];
-
-
-        const slideMediaRefs = new Set<string>();
-        
-        imageRefPatterns.forEach(pattern => {
-          const matches = slideXml.matchAll(pattern);
-          for (const match of matches) {
-            slideMediaRefs.add(match[1]);
-          }
-        });
-
-
-        console.log(`Media references in ${slideFile}:`, Array.from(slideMediaRefs));
-
-
-        // 查找对应的关系文件
-        const relsFile = slideFile.replace('.xml', '.xml.rels');
-        const relsXml = await zip.file(relsFile)?.async('string');
-        
-        if (relsXml) {
-          const relsObj = await parseStringPromise(relsXml, {
-            explicitArray: false,
-            mergeAttrs: true,
-            trim: true
-          });
-
-
-          const relationships = relsObj?.Relationships?.Relationship || [];
-          const mediaRels = Array.isArray(relationships) 
-            ? relationships 
-            : [relationships];
-
-
-          slideMediaRefs.forEach(rId => {
-            const matchingRel = mediaRels.find((rel: any) => 
-              rel.$?.['Id'] === rId && 
-              rel.$?.['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image'
-            );
-
-
-            if (matchingRel) {
-              const target = matchingRel.$['Target'];
-              const mediaFilename = target.split('/').pop();
-              if (mediaFilename) {
-                usedMediaFiles.add(mediaFilename);
-                console.log(`Found media reference in slide relationships: ${mediaFilename}`);
-              }
-            }
-          });
-        }
-
-
-      } catch (slideError) {
-        console.warn(`Error processing slide ${slideFile}:`, slideError);
-      }
-    }
-
-
-    // 3. 检查演示文稿关系文件
-    const presentationRelsFile = 'ppt/_rels/presentation.xml.rels';
-    const presentationRelsXml = await zip.file(presentationRelsFile)?.async('string');
-    
-    if (presentationRelsXml) {
-      const relsObj = await parseStringPromise(presentationRelsXml, {
-        explicitArray: false,
-        mergeAttrs: true,
-        trim: true
-      });
-
-
-      const relationships = relsObj?.Relationships?.Relationship || [];
-      const mediaRels = Array.isArray(relationships) 
-        ? relationships 
-        : [relationships];
-
-
-      mediaRels.forEach((rel: any) => {
-        if (rel?.$ && 
-            rel.$['Type'] === 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image') {
-          const target = rel.$['Target'];
-          const mediaFilename = target.split('/').pop();
-          if (mediaFilename) {
-            usedMediaFiles.add(mediaFilename);
-            console.log(`Found media reference in presentation relationships: ${mediaFilename}`);
-          }
-        }
-      });
-    }
-
-
-    console.log('Used media files:', Array.from(usedMediaFiles));
-
-
-    // 删除未使用的媒体文件
-    const allMediaFiles = Object.keys(zip.files)
-      .filter(file => 
-        (file.startsWith('ppt/media/') || file.startsWith('docProps/')) && 
-        file.match(/\.(png|jpg|jpeg|gif|bmp|svg)$/i)
-      )
-      .map(file => file.split('/').pop());
-    
-    const uniqueAllMediaFiles = [...new Set(allMediaFiles)];
-    const unusedMediaFiles = uniqueAllMediaFiles.filter(
-      file => !Array.from(usedMediaFiles).some(usedFile => 
-        file === usedFile || 
-        (usedFile && file.includes(usedFile)) || 
-        (file && usedFile.includes(file))
-      )
-    );
-
-
-    console.log('All media files:', uniqueAllMediaFiles);
-    console.log('Unused media files:', unusedMediaFiles);
-
-
-    // 删除未使用的媒体文件
-    unusedMediaFiles.forEach(filename => {
-      const mediaPath = `ppt/media/${filename}`;
-      const docPropsPath = `docProps/${filename}`;
-      
-      if (zip.files[mediaPath]) {
-        delete zip.files[mediaPath];
-        console.log(`Deleted unused media file: ${mediaPath}`);
-      }
-      
-      if (zip.files[docPropsPath]) {
-        delete zip.files[docPropsPath];
-        console.log(`Deleted unused media file: ${docPropsPath}`);
-      }
-    });
-
-
-    console.log(`Removed ${unusedMediaFiles.length} unused media files`);
-
-
-  } catch (error) {
-    console.error('Comprehensive error in removeUnusedMediaFiles:', error);
-  }
+async function checkEssentialFiles(zip: JSZip): Promise<boolean> {  
+  return essentialFiles.every(file => zip.file(file) !== null);  
 }
