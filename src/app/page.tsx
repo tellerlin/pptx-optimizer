@@ -35,7 +35,7 @@ export default function Home() {
 
 
     // 文件大小限制（例如：最大100MB）
-    const maxSize = 300 * 1024 * 1024; // 100MB
+    const maxSize = 300 * 1024 * 1024; // 300MB
     if (file.size > maxSize) {
       showAlert('File is too large. Maximum file size is 300MB', 'error');
       return;
